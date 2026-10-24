@@ -200,7 +200,7 @@
 
         // Discord's Activity proxy forwards this to the app's
         // backend endpoint at /api/token.
-        const response = await fetch("/.proxy/api/token", {
+        const response = await fetch("/api/token", {
           method: "POST",
           headers: {
             "Content-Type": "application/json"
@@ -208,7 +208,19 @@
           body: JSON.stringify({ code })
         });
 
-        const tokenData = await response.json();
+        const responseText = await response.text();
+
+let tokenData;
+
+try {
+  tokenData = JSON.parse(responseText);
+} catch {
+  throw new Error(
+    "Token endpoint returned HTML instead of JSON. " +
+    "HTTP status: " + response.status +
+    ". Check the /api/token route in Render."
+  );
+}
 
         if (!response.ok || !tokenData.access_token) {
           throw new Error(
