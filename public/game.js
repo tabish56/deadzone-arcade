@@ -280,12 +280,29 @@ function draw() {
 
 function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
 
-// --- EXTERNAL INITIALIZATION GATEWAY ---
+
+ // --- EXTERNAL INITIALIZATION GATEWAY ---
+let gameEngineStarted = false;
+
 function initGameEngine() {
-    console.log("Responsive Canvas System Live.");
+    if (gameEngineStarted) return;
+
+    if (!canvas || !ctx) {
+        console.error("DEADZONE: Game canvas is unavailable.");
+        return;
+    }
+
+    gameEngineStarted = true;
+
+    console.log("DEADZONE: Game engine initialized.");
+
     resizeGameView();
     resetGame();
     gameLoop();
 }
+
+// Make initialization available to index.html.
+window.initGameEngine = initGameEngine;
+
 
 
