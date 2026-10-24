@@ -46,11 +46,11 @@
             }
 
             try {
-                discordSdk = new Discord.DiscordSDK("YOUR_CLIENT_ID_HERE");
+                discordSdk = new Discord.DiscordSDK("1563568031567843568");
                 await discordSdk.ready();
                 
                 const { code } = await discordSdk.commands.authorize({
-                    client_id: "YOUR_CLIENT_ID_HERE",
+                    client_id: "1563568031567843568",
                     response_type: "code",
                     scope: ["identify"],
                 });
