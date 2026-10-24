@@ -158,7 +158,19 @@
         const discordSdk = new DiscordSDK(CLIENT_ID);
 
         status.textContent = "Connecting to Discord...";
-        await discordSdk.ready();
+        
+await Promise.race([
+  discordSdk.ready(),
+  new Promise((_, reject) =>
+    setTimeout(
+      () => reject(new Error(
+        "Discord SDK connection timed out. Check Activity launch and URL Mapping."
+      )),
+      10000
+    )
+  )
+]);
+
 
         status.textContent = "Authorizing player...";
 
