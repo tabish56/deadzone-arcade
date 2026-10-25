@@ -1,308 +1,907 @@
-const canvas = document.getElementById("gameCanvas");
-const ctx = canvas.getContext("2d");
 
-let player = { x: 400, y: 300, hp: 100, maxHp: 100, speed: 4, coins: 0 };
-let keys = {};
-let bullets = [];
-let zombies = [];
-let gameState = "PLAY"; 
-let wave = 1;
-let zombiesToKill = 5;
-let zombiesKilledThisWave = 0;
-let intermissionTimer = 0;
-let mouse = { x: 400, y: 300 };
-let isTouchDevice = false;
+(() => {
+  "use strict";
 
-// --- VIRTUAL JOYSTICK STATE FOR MOBILE/TABLET ---
-let joystick = { active: false, startX: 0, startY: 0, curX: 0, curY: 0, moveX: 0, moveY: 0 };
+  // DEADZONE: LAST SURVIVOR — multiplayer client
+  // Auto-shoots at the nearest living zombie.
+  // Discord authentication remains in index.html.
 
-// --- SCREEN ADAPTATION SCALE HANDLERS ---
-function resizeGameView() {
-    // Dynamic resolution scaling calculation
-    const viewWidth = window.innerWidth;
-    const viewHeight = window.innerHeight;
-    
-    // Scale standard coordinate grid boundaries safely
-    canvas.width = 800;
-    canvas.height = 600;
-    
-    // Force device input check parameters dynamically
-    if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
-        isTouchDevice = true;
-    }
-}
-window.addEventListener('resize', resizeGameView);
-window.addEventListener('orientationchange', resizeGameView);
+  const W = 900;
+  const H = 650;
 
-// --- INPUT LISTENERS (KEYBOARD & MOUSE) ---
-window.addEventListener("keydown", (e) => keys[e.key.toLowerCase()] = true);
-window.addEventListener("keyup", (e) => keys[e.key.toLowerCase()] = false);
+  const $ = (tag, styles = {}, text = "") => {
+    const el = document.createElement(tag);
+    Object.assign(el.style, styles);
+    if (text) el.textContent = text;
+    return el;
+  };
 
-canvas.addEventListener("mousemove", (e) => {
-    const rect = canvas.getBoundingClientRect();
-    mouse.x = (e.clientX - rect.left) * (canvas.width / rect.width);
-    mouse.y = (e.clientY - rect.top) * (canvas.height / rect.height);
-});
+  let socket = null;
+  let canvas = null;
+  let ctx = null;
+  let menu = null;
+  let roomInput = null;
+  let statusText = null;
+  let started = false;
+  let joined = false;
+  let roomId = "";
+  let lastInput = 0;
+  let lastShot = 0;
+  let joystick = { active: false, x: 0, y: 0, dx: 0, dy: 0 };
+  let upgradeOpen = false;
+  let upgradeChoices = [];
+  let gameStatus = "waiting";
 
-canvas.addEventListener("mousedown", () => {
-    if (gameState === "PLAY" && !isTouchDevice) fireManualBullet();
-    if (gameState === "GAMEOVER") resetGame();
-});
+  const keys = new Set();
 
-// --- INPUT LISTENERS (TOUCH CONTROLS FOR MOBILE/TABLET) ---
-canvas.addEventListener("touchstart", (e) => {
-    isTouchDevice = true;
-    if (gameState === "GAMEOVER") { resetGame(); return; }
-    
-    const rect = canvas.getBoundingClientRect();
-    for (let t of e.changedTouches) {
-        let tx = (t.clientX - rect.left) * (canvas.width / rect.width);
-        let ty = (t.clientY - rect.top) * (canvas.height / rect.height);
-        
-        if (tx < canvas.width / 2 && !joystick.active) {
-            joystick.active = true;
-            joystick.startX = tx;
-            joystick.startY = ty;
-            joystick.curX = tx;
-            joystick.curY = ty;
-        } else if (tx >= canvas.width / 2 && gameState === "PLAY") {
-            // Touch right side of mobile screen to shoot
-            let angle = Math.atan2(ty - player.y, tx - player.x);
-            bullets.push({ x: player.x, y: player.y, vx: Math.cos(angle) * 8, vy: Math.sin(angle) * 8 });
-        }
-    }
-}, { passive: true });
+  const game = {
+    players: [],
+    zombies: [],
+    bullets: [],
+    wave: 1,
+    kills: 0,
+    totalToSpawn: 8,
+    status: "waiting"
+  };
 
-canvas.addEventListener("touchmove", (e) => {
-    if (!joystick.active) return;
-    const rect = canvas.getBoundingClientRect();
-    for (let t of e.touches) {
-        let tx = (t.clientX - rect.left) * (canvas.width / rect.width);
-        let ty = (t.clientY - rect.top) * (canvas.height / rect.height);
-        
-        if (tx < canvas.width / 2 || joystick.active) {
-            joystick.curX = tx;
-            joystick.curY = ty;
-            
-            let dx = joystick.curX - joystick.startX;
-            let dy = joystick.curY - joystick.startY;
-            let dist = Math.hypot(dx, dy);
-            
-            if (dist > 50) {
-                dx = (dx / dist) * 50;
-                dy = (dy / dist) * 50;
-            }
-            joystick.moveX = dx / 50;
-            joystick.moveY = dy / 50;
-        }
-    }
-}, { passive: true });
+  function status(message, error = false) {
+    if (!statusText) return;
+    statusText.textContent = message;
+    statusText.style.color = error ? "#ff7070" : "#ddd";
+  }
 
-canvas.addEventListener("touchend", () => {
-    joystick.active = false;
-    joystick.moveX = 0;
-    joystick.moveY = 0;
-});
+  function makeMenu() {
+    menu = $("div", {
+      position: "fixed",
+      inset: "0",
+      zIndex: "9999",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      background: "radial-gradient(circle, #261010, #080808 70%)",
+      color: "#fff",
+      fontFamily: "Arial,sans-serif"
+    });
 
-// --- COMBAT ACTIONS ---
-function fireManualBullet() {
-    let angle = Math.atan2(mouse.y - player.y, mouse.x - player.x);
-    bullets.push({ x: player.x, y: player.y, vx: Math.cos(angle) * 8, vy: Math.sin(angle) * 8 });
-}
+    const panel = $("div", {
+      width: "min(390px,88vw)",
+      padding: "28px",
+      background: "#171717",
+      border: "1px solid #8e2525",
+      borderRadius: "12px",
+      boxShadow: "0 0 35px #55000066",
+      textAlign: "center"
+    });
 
-function fireAutoBullet(targetZ) {
-    let angle = Math.atan2(targetZ.y - player.y, targetZ.x - player.x);
-    bullets.push({ x: player.x, y: player.y, vx: Math.cos(angle) * 8, vy: Math.sin(angle) * 8 });
-}
+    const heading = $("h1", {
+      margin: "0 0 8px",
+      color: "#ff4545",
+      letterSpacing: "3px",
+      fontSize: "28px"
+    }, "DEADZONE");
 
-function spawnZombie() {
-    let edge = Math.floor(Math.random() * 4);
-    let x, y;
-    if (edge === 0) { x = Math.random() * canvas.width; y = -20; }
-    else if (edge === 1) { x = canvas.width + 20; y = Math.random() * canvas.height; }
-    else if (edge === 2) { x = Math.random() * canvas.width; y = canvas.height + 20; }
-    else { x = -20; y = Math.random() * canvas.height; }
-    zombies.push({ x, y, hp: 20 + wave * 5, speed: 1 + Math.random() * 0.8 });
-}
+    const subtitle = $("p", {
+      margin: "0 0 24px",
+      color: "#bbb",
+      letterSpacing: "2px",
+      fontSize: "12px"
+    }, "LAST SURVIVOR · MULTIPLAYER");
 
-function startIntermission() {
-    gameState = "INTERMISSION";
-    intermissionTimer = 5 * 60; 
-}
+    roomInput = $("input", {
+      boxSizing: "border-box",
+      width: "100%",
+      padding: "13px",
+      marginBottom: "12px",
+      background: "#080808",
+      border: "1px solid #444",
+      borderRadius: "5px",
+      color: "#fff",
+      fontSize: "17px",
+      textAlign: "center",
+      textTransform: "uppercase",
+      outline: "none"
+    });
 
-function nextWave() {
-    wave++;
-    zombiesToKill = 5 + wave * 3;
-    zombiesKilledThisWave = 0;
-    gameState = "PLAY";
-}
+    roomInput.id = "deadzone-room-code";
+    roomInput.name = "roomCode";
+    roomInput.placeholder = "ENTER ROOM CODE";
+    roomInput.maxLength = 24;
+    roomInput.autocomplete = "off";
+    roomInput.spellcheck = false;
 
-function resetGame() {
-    player = { x: 400, y: 300, hp: 100, maxHp: 100, speed: 4, coins: 0 };
-    bullets = []; zombies = [];
-    wave = 1; zombiesToKill = 5; zombiesKilledThisWave = 0;
-    gameState = "PLAY";
-}
+    function makeButton(label) {
+      const button = $("button", {
+        width: "100%",
+        padding: "13px",
+        marginTop: "8px",
+        border: "0",
+        borderRadius: "5px",
+        background: "#b32626",
+        color: "#fff",
+        fontSize: "14px",
+        fontWeight: "bold",
+        letterSpacing: "1px",
+        cursor: "pointer"
+      }, label);
 
-let autoFireCooldown = 0;
+      button.type = "button";
+      button.addEventListener("mouseenter", () => {
+        button.style.background = "#e13838";
+      });
+      button.addEventListener("mouseleave", () => {
+        button.style.background = "#b32626";
+      });
 
-function update() {
-    if (gameState === "PLAY") {
-        if (keys['w'] || keys['arrowup']) player.y -= player.speed;
-        if (keys['s'] || keys['arrowdown']) player.y += player.speed;
-        if (keys['a'] || keys['arrowleft']) player.x -= player.speed;
-        if (keys['d'] || keys['arrowright']) player.x += player.speed;
-
-        if (joystick.active) {
-            player.x += joystick.moveX * player.speed;
-            player.y += joystick.moveY * player.speed;
-        }
-
-        player.x = Math.max(15, Math.min(canvas.width - 15, player.x));
-        player.y = Math.max(15, Math.min(canvas.height - 15, player.y));
-
-        if (zombies.length + zombiesKilledThisWave < zombiesToKill && Math.random() < 0.02) {
-            spawnZombie();
-        }
-
-        if (isTouchDevice && zombies.length > 0) {
-            autoFireCooldown++;
-            if (autoFireCooldown >= 25) { 
-                let nearestZ = null;
-                let minDist = Infinity;
-                zombies.forEach(z => {
-                    let d = Math.hypot(z.x - player.x, z.y - player.y);
-                    if (d < minDist) { minDist = d; nearestZ = z; }
-                });
-                if (nearestZ) fireAutoBullet(nearestZ);
-                autoFireCooldown = 0;
-            }
-        }
-
-        for (let i = bullets.length - 1; i >= 0; i--) {
-            let b = bullets[i];
-            b.x += b.vx; b.y += b.vy;
-            if (b.x < 0 || b.x > canvas.width || b.y < 0 || b.y > canvas.height) {
-                bullets.splice(i, 1);
-            }
-        }
-
-        for (let i = zombies.length - 1; i >= 0; i--) {
-            let z = zombies[i];
-            let angle = Math.atan2(player.y - z.y, player.x - z.x);
-            z.x += Math.cos(angle) * z.speed;
-            z.y += Math.sin(angle) * z.speed;
-
-            if (Math.hypot(player.x - z.x, player.y - z.y) < 22) {
-                player.hp -= 0.3;
-                if (player.hp <= 0) gameState = "GAMEOVER";
-            }
-
-            for (let j = bullets.length - 1; j >= 0; j--) {
-                let b = bullets[j];
-                if (Math.hypot(b.x - z.x, b.y - z.y) < 16) {
-                    bullets.splice(j, 1);
-                    z.hp -= 10;
-                    if (z.hp <= 0) {
-                        zombies.splice(i, 1);
-                        player.coins += 5; 
-                        zombiesKilledThisWave++;
-                        if (zombiesKilledThisWave >= zombiesToKill && zombies.length === 0) {
-                            startIntermission();
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    } else if (gameState === "INTERMISSION") {
-        intermissionTimer--;
-        if (intermissionTimer <= 0) nextWave();
-    }
-}
-
-function draw() {
-    ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-
-    if (!isTouchDevice) {
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
-        ctx.beginPath(); ctx.arc(mouse.x, mouse.y, 8, 0, Math.PI * 2); ctx.stroke();
+      return button;
     }
 
-    // Draw Player Agent
-    ctx.fillStyle = "#00ffcc";
-    ctx.beginPath(); ctx.arc(player.x, player.y, 15, 0, Math.PI * 2); ctx.fill();
+    const createButton = makeButton("CREATE NEW ROOM");
+    const joinButton = makeButton("JOIN ROOM");
 
-    // Draw Bullets
-    ctx.fillStyle = "#ffcc00";
-    bullets.forEach(b => { ctx.beginPath(); ctx.arc(b.x, b.y, 3, 0, Math.PI * 2); ctx.fill(); });
+    statusText = $("p", {
+      minHeight: "36px",
+      margin: "18px 0 0",
+      color: "#ddd",
+      fontSize: "13px",
+      lineHeight: "1.5",
+      overflowWrap: "anywhere"
+    }, "Connecting to multiplayer server…");
 
-    // Draw Zombies
-    ctx.fillStyle = "#ff3333";
-    zombies.forEach(z => { ctx.beginPath(); ctx.arc(z.x, z.y, 12, 0, Math.PI * 2); ctx.fill(); });
+    createButton.addEventListener("click", () => {
+      const code = Math.random().toString(36).slice(2, 8).toUpperCase();
+      roomInput.value = code;
+      joinRoom(code);
+    });
 
-    // Render Virtual Touch Joystick Graphic Overlay
-    if (isTouchDevice && joystick.active) {
-        ctx.fillStyle = "rgba(255, 255, 255, 0.1)";
-        ctx.beginPath(); ctx.arc(joystick.startX, joystick.startY, 50, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = "rgba(0, 255, 204, 0.4)";
-        ctx.beginPath(); ctx.arc(joystick.curX, joystick.curY, 20, 0, Math.PI * 2); ctx.fill();
+    joinButton.addEventListener("click", () => {
+      joinRoom(roomInput.value.trim().toUpperCase());
+    });
+
+    roomInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        joinRoom(roomInput.value.trim().toUpperCase());
+      }
+    });
+
+    panel.append(heading, subtitle, roomInput, createButton, joinButton, statusText);
+    menu.appendChild(panel);
+    document.body.appendChild(menu);
+  }
+
+  function connectSocket() {
+    if (typeof window.io !== "function") {
+      status("Socket.IO failed to load. Check /socket.io/socket.io.js.", true);
+      return;
     }
 
-    // HUD Text Metrics
-    ctx.fillStyle = "#fff"; ctx.font = "16px monospace";
-    ctx.fillText(`WAVE: ${wave}`, 20, 30);
-    ctx.fillText(`COINS: ${player.coins}`, 20, 50);
-    ctx.fillText(`ZOMBIES: ${Math.max(0, zombiesToKill - zombiesKilledThisWave)}`, 20, 70);
+    socket = window.io({
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      timeout: 10000
+    });
 
-    // Health UI Bar
-    ctx.fillStyle = "#333"; ctx.fillRect(canvas.width - 170, 20, 150, 15);
-    ctx.fillStyle = "#ff3333"; ctx.fillRect(canvas.width - 170, 20, (player.hp / player.maxHp) * 150, 15);
+    socket.on("connect", () => {
+      console.log("[DEADZONE] Socket.IO connected:", socket.id);
+      status("Connected. Create a room or enter a room code.");
 
-    if (gameState === "INTERMISSION") {
-        ctx.fillStyle = "rgba(0, 0, 0, 0.6)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#fff"; ctx.font = "30px sans-serif"; ctx.textAlign = "center";
-        ctx.fillText(`WAVE COMPLETED`, canvas.width / 2, canvas.height / 2 - 20);
-        ctx.font = "20px sans-serif";
-        ctx.fillText(`Next wave in: ${Math.ceil(intermissionTimer / 60)}s`, canvas.width / 2, canvas.height / 2 + 20);
-        ctx.textAlign = "left";
-    } 
-       if (gameState === "GAMEOVER") {
-        ctx.fillStyle = "rgba(139, 0, 0, 0.85)"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.fillStyle = "#fff"; ctx.font = "40px sans-serif"; ctx.textAlign = "center";
-        ctx.fillText("YOU WERE OVERRUN", canvas.width / 2, canvas.height / 2 - 20);
-        ctx.font = "20px sans-serif";
-        ctx.fillText(isTouchDevice ? "Tap to respawn" : "Click to respawn", canvas.width / 2, canvas.height / 2 + 30);
-        ctx.textAlign = "left";
+      if (joined && roomId) {
+        socket.emit("room:join", { roomId }, (response) => {
+          if (response?.room) applyState(response.room);
+          if (response?.error) status(response.error, true);
+        });
+      }
+    });
+
+    socket.on("connect_error", (error) => {
+      console.error("[DEADZONE] Socket.IO error:", error.message);
+      status("Cannot connect to the game server. Check npm start.", true);
+    });
+
+    socket.on("disconnect", (reason) => {
+      console.warn("[DEADZONE] Disconnected:", reason);
+      keys.clear();
+      status("Disconnected. Reconnecting…", true);
+    });
+
+    socket.on("game:state", (data) => {
+      if (!data || typeof data !== "object") return;
+
+      applyState(data);
+
+      if (!started) startGame();
+      if (menu) menu.style.display = "none";
+      draw();
+    });
+
+    socket.on("game:upgrade-break", () => {
+      const me = getMyPlayer();
+      upgradeChoices = Array.isArray(me?.choices) ? me.choices : [];
+      upgradeOpen = true;
+      gameStatus = "upgrades";
+      draw();
+    });
+  }
+
+  function joinRoom(code) {
+    if (!code || !/^[A-Z0-9_-]{1,24}$/.test(code)) {
+      status("Enter a valid room code.", true);
+      return;
     }
-} // <-- THIS closing bracket finishes your draw() function!
 
-function gameLoop() { update(); draw(); requestAnimationFrame(gameLoop); }
+    if (!socket || !socket.connected) {
+      status("Connecting to the server. Please wait and try again.", true);
+      return;
+    }
 
+    roomId = code;
+    status("Joining room " + code + "…");
 
- // --- EXTERNAL INITIALIZATION GATEWAY ---
-let gameEngineStarted = false;
+    socket.emit("room:join", { roomId: code }, (response) => {
+      console.log("[DEADZONE] Room join response:", response);
 
-function initGameEngine() {
-    if (gameEngineStarted) return;
-
-    if (!canvas || !ctx) {
-        console.error("DEADZONE: Game canvas is unavailable.");
+      if (!response || response.ok === false || response.error) {
+        status(response?.error || "Could not join room.", true);
         return;
+      }
+
+      joined = true;
+      roomId = code;
+
+      if (response.room) {
+        applyState(response.room);
+        if (!started) startGame();
+        if (menu) menu.style.display = "none";
+        draw();
+      }
+
+      status("Joined room " + code);
+    });
+  }
+
+  function applyState(data) {
+    game.players = Array.isArray(data.players) ? data.players : [];
+    game.zombies = Array.isArray(data.zombies) ? data.zombies : [];
+    game.bullets = Array.isArray(data.bullets) ? data.bullets : [];
+    game.wave = Number(data.wave) || 1;
+    game.kills = Number(data.kills) || 0;
+    game.totalToSpawn = Number(data.totalToSpawn) || 0;
+    game.status = data.status || "playing";
+    gameStatus = game.status;
+
+    if (data.roomId) roomId = data.roomId;
+
+    const me = getMyPlayer();
+    upgradeChoices = Array.isArray(me?.choices) ? me.choices : [];
+
+    if (gameStatus === "upgrades" && upgradeChoices.length) {
+      upgradeOpen = true;
+    } else if (gameStatus !== "upgrades") {
+      upgradeOpen = false;
+    }
+  }
+
+  function getMyPlayer() {
+    if (!socket) return null;
+    return game.players.find((player) => player.id === socket.id) || null;
+  }
+
+  function startGame() {
+    if (started) return;
+    started = true;
+
+    canvas = $("canvas", {
+      position: "fixed",
+      inset: "0",
+      width: "100%",
+      height: "100%",
+      display: "block",
+      background: "#101010",
+      touchAction: "none",
+      outline: "none",
+      cursor: "crosshair"
+    });
+
+    canvas.width = W;
+    canvas.height = H;
+    canvas.tabIndex = 0;
+    canvas.setAttribute("aria-label", "DEADZONE game area");
+    ctx = canvas.getContext("2d");
+
+    document.body.style.margin = "0";
+    document.body.style.overflow = "hidden";
+    document.body.appendChild(canvas);
+
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
+    canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", clearControls);
+
+    requestAnimationFrame(gameLoop);
+  }
+
+  function onKeyDown(event) {
+    const key = event.key.toLowerCase();
+    const movementKeys = [
+      "w", "a", "s", "d",
+      "arrowup", "arrowdown", "arrowleft", "arrowright"
+    ];
+
+    if (movementKeys.includes(key)) {
+      keys.add(key);
+      event.preventDefault();
     }
 
-    gameEngineStarted = true;
+    if (key === " " && upgradeOpen) {
+      event.preventDefault();
+      chooseUpgrade(0);
+    }
 
-    console.log("DEADZONE: Game engine initialized.");
+    if (upgradeOpen && /^[1-3]$/.test(key)) {
+      chooseUpgrade(Number(key) - 1);
+    }
+  }
 
-    resizeGameView();
-    resetGame();
-    gameLoop();
-}
+  function onKeyUp(event) {
+    keys.delete(event.key.toLowerCase());
+  }
 
-// Make initialization available to index.html.
-window.initGameEngine = initGameEngine;
+  function clearControls() {
+    keys.clear();
+    joystick.active = false;
+    joystick.dx = 0;
+    joystick.dy = 0;
+  }
 
+  function onPointerMove(event) {
+    if (joystick.active) updateJoystick(event);
+  }
 
+  function onPointerDown(event) {
+    if (event.button !== undefined && event.button !== 0) return;
 
+    canvas.focus();
+
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * W / rect.width;
+    const y = (event.clientY - rect.top) * H / rect.height;
+
+    if (upgradeOpen) {
+      chooseUpgradeAt(x, y);
+      return;
+    }
+
+    if (event.pointerType === "touch" && x < W * 0.45) {
+      joystick.active = true;
+      joystick.x = x;
+      joystick.y = y;
+      joystick.dx = 0;
+      joystick.dy = 0;
+      updateJoystick(event);
+    }
+
+    try {
+      canvas.setPointerCapture(event.pointerId);
+    } catch (_) {}
+  }
+
+  function onPointerUp() {
+    joystick.active = false;
+    joystick.dx = 0;
+    joystick.dy = 0;
+  }
+
+  function updateJoystick(event) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (event.clientX - rect.left) * W / rect.width;
+    const y = (event.clientY - rect.top) * H / rect.height;
+    const dx = x - joystick.x;
+    const dy = y - joystick.y;
+    const length = Math.hypot(dx, dy);
+    const scale = length > 55 ? 55 / length : 1;
+
+    joystick.dx = dx * scale / 55;
+    joystick.dy = dy * scale / 55;
+  }
+
+  function sendMovement() {
+    if (!socket?.connected || !joined || !started) return;
+
+    let x = 0;
+    let y = 0;
+
+    if (keys.has("w") || keys.has("arrowup")) y -= 1;
+    if (keys.has("s") || keys.has("arrowdown")) y += 1;
+    if (keys.has("a") || keys.has("arrowleft")) x -= 1;
+    if (keys.has("d") || keys.has("arrowright")) x += 1;
+
+    if (joystick.active) {
+      x = joystick.dx;
+      y = joystick.dy;
+    }
+
+    const length = Math.hypot(x, y);
+    if (length > 1) {
+      x /= length;
+      y /= length;
+    }
+
+    const now = performance.now();
+    if (now - lastInput < 33) return;
+    lastInput = now;
+
+    socket.emit("player:input", { x, y });
+  }
+
+  // Automatically shoots at the nearest living zombie.
+  function shootAtNearestZombie() {
+    if (!socket?.connected || !joined || !started) return;
+    if (gameStatus !== "playing") return;
+
+    const now = performance.now();
+
+    // Client pacing; server-side cooldown still controls actual firing.
+    if (now - lastShot < 140) return;
+
+    const me = getMyPlayer();
+    if (!me || me.alive === false || Number(me.hp) <= 0) return;
+    if (!Array.isArray(game.zombies) || game.zombies.length === 0) return;
+
+    let target = null;
+    let nearestDistanceSquared = Infinity;
+
+    for (const zombie of game.zombies) {
+      if (!zombie || zombie.alive === false || Number(zombie.hp) <= 0) {
+        continue;
+      }
+
+      const zx = Number(zombie.x);
+      const zy = Number(zombie.y);
+
+      if (!Number.isFinite(zx) || !Number.isFinite(zy)) continue;
+
+      const dx = zx - Number(me.x);
+      const dy = zy - Number(me.y);
+      const distanceSquared = dx * dx + dy * dy;
+
+      if (distanceSquared < nearestDistanceSquared) {
+        nearestDistanceSquared = distanceSquared;
+        target = { x: zx, y: zy };
+      }
+    }
+
+    if (!target) return;
+
+    const dx = target.x - Number(me.x);
+    const dy = target.y - Number(me.y);
+
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+    if (dx === 0 && dy === 0) return;
+
+    lastShot = now;
+    socket.emit("player:shoot", { dx, dy });
+  }
+
+  function chooseUpgrade(index) {
+    if (!upgradeOpen || !socket?.connected) return;
+
+    const choice = upgradeChoices[index];
+    if (!choice?.id) return;
+
+    socket.emit("player:upgrade", { id: choice.id });
+    upgradeOpen = false;
+  }
+
+  function chooseUpgradeAt(x, y) {
+    if (!upgradeOpen || !upgradeChoices.length) return;
+
+    const count = upgradeChoices.length;
+    const cardWidth = Math.min(220, (W - 60) / count);
+    const gap = 14;
+    const totalWidth = count * cardWidth + (count - 1) * gap;
+    const startX = (W - totalWidth) / 2;
+    const cardHeight = 210;
+    const top = H / 2 - 85;
+
+    for (let i = 0; i < count; i++) {
+      const left = startX + i * (cardWidth + gap);
+
+      if (
+        x >= left && x <= left + cardWidth &&
+        y >= top && y <= top + cardHeight
+      ) {
+        chooseUpgrade(i);
+        return;
+      }
+    }
+  }
+
+  function gameLoop() {
+    if (started) {
+      sendMovement();
+      shootAtNearestZombie();
+      draw();
+    }
+
+    requestAnimationFrame(gameLoop);
+  }
+
+  function drawGrid() {
+    ctx.fillStyle = "#101010";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.strokeStyle = "#202020";
+    ctx.lineWidth = 1;
+
+    for (let x = 0; x < W; x += 40) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    }
+
+    for (let y = 0; y < H; y += 40) {
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = "#5d1b1b";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, W - 2, H - 2);
+  }
+
+  function drawPlayer(player, isMe) {
+    const x = Number(player.x) || 0;
+    const y = Number(player.y) || 0;
+    const radius = 15;
+
+    ctx.beginPath();
+    ctx.fillStyle = isMe ? "#45a6ff" : "#bd7aff";
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = isMe ? "#9bd4ff" : "#ead1ff";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 12px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(isMe ? "YOU" : "ALLY", x, y - radius - 9);
+
+    const hp = Math.max(0, Number(player.hp) || 0);
+    const maxHp = Math.max(1, Number(player.maxHp) || 100);
+
+    ctx.fillStyle = "#333";
+    ctx.fillRect(x - 16, y + radius + 5, 32, 4);
+
+    ctx.fillStyle = hp > maxHp * 0.3 ? "#45ed75" : "#ff4545";
+    ctx.fillRect(
+      x - 16,
+      y + radius + 5,
+      32 * Math.min(1, hp / maxHp),
+      4
+    );
+  }
+
+  function drawZombie(zombie) {
+    ctx.beginPath();
+    ctx.fillStyle = "#69a34b";
+    ctx.arc(Number(zombie.x) || 0, Number(zombie.y) || 0, 13, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.strokeStyle = "#b8e69a";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  function drawBullet(bullet) {
+    ctx.beginPath();
+    ctx.fillStyle = "#ffd54a";
+    ctx.arc(Number(bullet.x) || 0, Number(bullet.y) || 0, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawHud() {
+    const me = getMyPlayer();
+    const hp = me ? Math.max(0, Number(me.hp) || 0) : 0;
+    const maxHp = me ? Math.max(1, Number(me.maxHp) || 100) : 100;
+    const coins = me ? Number(me.coins) || 0 : 0;
+    const alive = game.players.filter((p) => p.alive !== false).length;
+
+    ctx.textAlign = "left";
+    ctx.fillStyle = "#f4f4f4";
+    ctx.font = "bold 14px monospace";
+
+    ctx.fillText("WAVE: " + game.wave, 22, 30);
+    ctx.fillText("ROOM: " + (roomId || "------"), 22, 52);
+    ctx.fillText("PLAYERS: " + alive + "/" + game.players.length, 22, 74);
+    ctx.fillText("KILLS: " + game.kills + "/" + game.totalToSpawn, 22, 96);
+    ctx.fillText("COINS: " + coins, 22, 118);
+
+    const barWidth = 170;
+    const barX = W - barWidth - 22;
+    const barY = 22;
+
+    ctx.fillStyle = "#333";
+    ctx.fillRect(barX, barY, barWidth, 16);
+
+    ctx.fillStyle = hp > maxHp * 0.3 ? "#45ed75" : "#ff4545";
+    ctx.fillRect(barX, barY, barWidth * Math.min(1, hp / maxHp), 16);
+
+    ctx.fillStyle = "#eee";
+    ctx.font = "bold 12px Arial";
+    ctx.fillText("HP " + hp + "/" + maxHp, barX, barY + 33);
+
+    if (gameStatus === "waiting") {
+      centerMessage("WAITING FOR GAME");
+    } else if (gameStatus === "gameover") {
+      centerMessage("GAME OVER");
+    } else if (gameStatus === "upgrades") {
+      centerMessage("CHOOSE AN UPGRADE");
+    } else if (game.zombies.length === 0 && game.status === "playing") {
+      ctx.fillStyle = "#ccc";
+      ctx.font = "13px monospace";
+      ctx.fillText("NEXT WAVE…", W / 2 - 45, 28);
+    }
+  }
+
+  function centerMessage(message) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#fff";
+    ctx.font = "bold 22px Arial";
+    ctx.fillText(message, W / 2, H / 2 - 35);
+  }
+
+  function drawJoystick() {
+    if (!joystick.active) return;
+
+    ctx.globalAlpha = 0.6;
+
+    ctx.beginPath();
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 3;
+    ctx.arc(joystick.x, joystick.y, 55, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.fillStyle = "#ddd";
+    ctx.arc(
+      joystick.x + joystick.dx * 45,
+      joystick.y + joystick.dy * 45,
+      18,
+      0,
+      Math.PI * 2
+    );
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+  }
+
+  function upgradeDetails(choice, me) {
+    if (!choice || !me) return { current: "", result: "" };
+
+    const n = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
+
+    switch (choice.id) {
+      case "damage": {
+        const before = n(me.damage);
+        return {
+          current: `Damage: ${before}`,
+          result: `After: ${before + 5} (+5)`
+        };
+      }
+
+      case "speed": {
+        const before = n(me.speed);
+        const after = Math.min(7, before + 0.6);
+        return {
+          current: `Speed: ${before.toFixed(1)}`,
+          result: `After: ${after.toFixed(1)} (+${(after - before).toFixed(1)})`
+        };
+      }
+
+      case "health": {
+        const beforeMax = n(me.maxHp) || 100;
+        const beforeHp = n(me.hp);
+        const afterMax = beforeMax + 25;
+        const afterHp = Math.min(afterMax, beforeHp + 25);
+        return {
+          current: `Max HP: ${beforeMax} · HP: ${Math.ceil(beforeHp)}`,
+          result: `After: Max ${afterMax} · HP ${Math.ceil(afterHp)}`
+        };
+      }
+
+      case "rapid": {
+        const before = n(me.fireDelay) || 18;
+        const after = Math.max(5, before - 3);
+        return {
+          current: `Fire delay: ${before} ticks`,
+          result: `After: ${after} ticks (-${before - after})`
+        };
+      }
+
+      case "armor": {
+        const before = n(me.armor);
+        const after = Math.min(0.65, before + 0.15);
+        return {
+          current: `Damage reduction: ${Math.round(before * 100)}%`,
+          result: `After: ${Math.round(after * 100)}% (+${Math.round((after - before) * 100)}%)`
+        };
+      }
+
+      case "heal": {
+        const hp = n(me.hp);
+        const maxHp = n(me.maxHp) || 100;
+        const after = Math.min(maxHp, hp + 40);
+        return {
+          current: `HP: ${Math.ceil(hp)} / ${maxHp}`,
+          result: `After: ${Math.ceil(after)} / ${maxHp} (+${Math.ceil(after - hp)} HP)`
+        };
+      }
+
+      default:
+        return { current: "", result: "" };
+    }
+  }
+
+  function drawUpgrades() {
+    ctx.fillStyle = "rgba(0,0,0,0.88)";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#ff5151";
+    ctx.font = "bold 28px Arial";
+    ctx.fillText("WAVE BREAK", W / 2, 75);
+
+    ctx.fillStyle = "#fff";
+    ctx.font = "16px Arial";
+    ctx.fillText("Choose one upgrade — see exactly what changes", W / 2, 105);
+
+    const count = upgradeChoices.length;
+
+    if (!count) {
+      ctx.fillText("Waiting for upgrade choices…", W / 2, H / 2);
+      return;
+    }
+
+    const me = getMyPlayer();
+    const cardWidth = Math.min(220, (W - 60) / count);
+    const cardHeight = 210;
+    const gap = 14;
+    const totalWidth = count * cardWidth + (count - 1) * gap;
+    const startX = (W - totalWidth) / 2;
+    const top = H / 2 - 85;
+
+    upgradeChoices.forEach((choice, index) => {
+      const x = startX + index * (cardWidth + gap);
+      const details = upgradeDetails(choice, me);
+
+      ctx.fillStyle = "#1e1e1e";
+      ctx.fillRect(x, top, cardWidth, cardHeight);
+
+      ctx.strokeStyle = "#a32c2c";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(x, top, cardWidth, cardHeight);
+
+      ctx.fillStyle = "#ff7777";
+      ctx.font = "bold 15px Arial";
+      ctx.fillText(
+        String(choice.name || choice.id || "UPGRADE").toUpperCase(),
+        x + cardWidth / 2,
+        top + 28,
+        cardWidth - 12
+      );
+
+      ctx.fillStyle = "#ddd";
+      ctx.font = "13px Arial";
+      drawWrappedText(
+        String(choice.description || "Improve your survivor."),
+        x + cardWidth / 2,
+        top + 54,
+        cardWidth - 20,
+        17
+      );
+
+      ctx.fillStyle = "#b9c7d8";
+      ctx.font = "12px monospace";
+
+      if (details.current) {
+        ctx.fillText(
+          details.current,
+          x + cardWidth / 2,
+          top + 119,
+          cardWidth - 12
+        );
+      }
+
+      ctx.fillStyle = "#65f09a";
+      ctx.font = "bold 12px monospace";
+
+      if (details.result) {
+        ctx.fillText(
+          details.result,
+          x + cardWidth / 2,
+          top + 143,
+          cardWidth - 12
+        );
+      }
+
+      ctx.fillStyle = "#aaa";
+      ctx.font = "12px monospace";
+      ctx.fillText(
+        "PRESS " + (index + 1),
+        x + cardWidth / 2,
+        top + 188
+      );
+    });
+
+    ctx.fillStyle = "#aaa";
+    ctx.font = "12px Arial";
+    ctx.fillText("Click a card or press 1, 2, or 3", W / 2, H - 20);
+  }
+
+  function drawWrappedText(text, x, y, maxWidth, lineHeight) {
+    const words = text.split(/\s+/);
+    let line = "";
+    let lineY = y;
+
+    for (const word of words) {
+      const test = line ? line + " " + word : word;
+
+      if (ctx.measureText(test).width > maxWidth && line) {
+        ctx.fillText(line, x, lineY, maxWidth);
+        line = word;
+        lineY += lineHeight;
+      } else {
+        line = test;
+      }
+    }
+
+    if (line) ctx.fillText(line, x, lineY, maxWidth);
+  }
+
+  function draw() {
+    if (!ctx || !canvas) return;
+
+    drawGrid();
+    game.bullets.forEach(drawBullet);
+    game.zombies.forEach(drawZombie);
+
+    const me = getMyPlayer();
+
+    game.players.forEach((player) => {
+      drawPlayer(player, !!me && player.id === me.id);
+    });
+
+    drawHud();
+    drawJoystick();
+
+    if (upgradeOpen || gameStatus === "upgrades") {
+      drawUpgrades();
+    }
+  }
+
+  function init() {
+    makeMenu();
+    connectSocket();
+  }
+
+  // Required by index.html after Discord authentication succeeds.
+  window.initGameEngine = function () {
+    if (!menu) init();
+  };
+
+  init();
+
+  window.addEventListener("beforeunload", () => {
+    if (socket) socket.disconnect();
+  });
+})();
